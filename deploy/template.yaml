@@ -46,6 +46,13 @@ objects:
                   value: "${OC_SERVER}"
                 - name: PROMETHEUS_URL
                   value: "${PROMETHEUS_URL}"
+              resources:
+                limits:
+                  cpu: 2000m
+                  memory: 2Gi
+                requests:
+                  cpu: 1000m
+                  memory: 1Gi
 
   - apiVersion: v1
     kind: Service
