@@ -14,7 +14,7 @@ a gevent worker.
 **Runtime:** Flask, Flask-SocketIO, Flask-CORS, Flask-Caching, crc-bonfire, kubernetes (Python
 client), prometheus-api-client, GQL, Gunicorn, gevent, urllib3, multidict
 
-**Dev/Test:** pytest
+**Test:** pytest (listed under runtime packages in the Pipfile, not as a dev dependency)
 
 ## Development Commands
 
@@ -28,6 +28,7 @@ make run-proxy       # Start Caddy dev proxy on port 8000
 make test            # Run integration tests (requires live cluster)
 make requirements    # Regenerate requirements.txt from Pipfile.lock
 make build           # Build Docker image
+make run-docker      # Run the built Docker image
 ```
 
 CI runs Tekton pipelines (`.tekton/`) that build the container image and run security scans (SAST,
@@ -70,9 +71,10 @@ details, environment variables, and design decisions.
   (used only when run directly via `socketio.run`). If you change the Flask port in the Makefile,
   update `proxy/Caddyfile` to match.
 - **Global GraphQL client.** `flask_app_helpers.py` assigns the GQL client to a module-level global
-  `_client` via `create_gql_client()`, which runs as a `before_request` handler. This means the
-  client is re-created on every request. The global is consumed by Bonfire's qontract module, not
-  by the Firelink code directly — do not remove it even though it appears unused in this codebase.
+  `_client` via `create_gql_client()`, which is called once at startup (not per-request, despite
+  the `before_request_funcs` assignment in `server.py`). The global is consumed by Bonfire's
+  qontract module, not by the Firelink code directly — do not remove it even though it appears
+  unused in this codebase.
 - **Integration tests require a live cluster.** All tests in `tests/` are integration tests that
   reserve and release real namespaces on an OpenShift cluster. They cannot run in isolation, in CI,
   or without a valid kubecontext. Running them against a cluster with limited namespace capacity

@@ -15,18 +15,32 @@ communicates directly with the OpenShift API (via the `oc` CLI and Kubernetes cl
 ### Firelink Ecosystem
 
 ```
-Browser  -->  OAuth Proxy  -->  Caddy Proxy (firelink-proxy)  -->  Firelink Backend (this repo)  -->  OpenShift / Bonfire
-                                          |                                                      -->  Prometheus
-                                  Caddy (firelink-frontend, static files only)                   -->  app-interface (GraphQL)
-                                          |
-                                    React SPA
+Browser  -->  OpenShift Route (:8888 TLS)
+                |
+          OAuth Proxy sidecar (:8888)          ── firelink-proxy pod ──
+                |                              |                      |
+          Caddy reverse proxy (:8000)          |  two containers in   |
+              /   \                            |  a single pod        |
+             /     \                           ── (sidecar pattern) ──
+            v       v
+  /api/*  -->  firelink-backend service  -->  OpenShift / Bonfire
+                                         -->  Prometheus
+  /*      -->  firelink-frontend service -->  app-interface (GraphQL)
+               (React SPA, own Caddy)
 ```
 
-In production, a separate [firelink-proxy][firelink-proxy] component — an OpenShift OAuth Proxy
-paired with a Caddy reverse proxy — sits in front of both the frontend and backend. The proxy
-handles OAuth authentication and routes `/api/*` requests to this backend. During local development,
-a Caddy config in `proxy/Caddyfile` serves the same routing role, forwarding `/api/*` to the Flask
-dev server on port 5001 and all other requests to the frontend dev server on port 3000.
+In production, [firelink-proxy][firelink-proxy] is a single pod with two containers (sidecar
+pattern): an OpenShift OAuth Proxy listening on port 8888 (HTTPS) and a Caddy reverse proxy
+listening on port 8000 (HTTP). The OAuth Proxy handles authentication and forwards to Caddy over
+localhost. Caddy routes `/api/*` to this backend service and all other requests to the
+[firelink-frontend][firelink-frontend] service (Caddy does not serve static files — it
+reverse-proxies to the frontend's own pod). A dedicated route for `/api/firelink/socket.io/*` adds
+WebSocket upgrade headers (`Connection`, `Upgrade`) for WebSocket traffic. See the
+[firelink-proxy][firelink-proxy] repository for full proxy configuration details.
+
+During local development, a Caddy config in `proxy/Caddyfile` serves the same routing role,
+forwarding `/api/*` to the Flask dev server on port 5001 and all other requests to the frontend dev
+server on port 3000.
 
 The backend has no authentication logic of its own — it trusts the `requester` value the frontend
 sends in API request payloads. All access control relies on the OAuth proxy layer.
@@ -35,7 +49,7 @@ sends in API request payloads. All access control relies on the OAuth proxy laye
 
 - **Language**: Python >= 3.11
 - **Web framework**: Flask
-- **WebSocket**: Flask-SocketIO (gevent async mode)
+- **WebSocket**: Flask-SocketIO (gevent async mode, long-polling transport)
 - **CORS**: Flask-CORS
 - **Caching**: Flask-Caching (simple in-memory cache)
 - **WSGI server**: Gunicorn with gevent worker
@@ -72,10 +86,11 @@ deploy/
 ### `server.py` — Application Entry Point
 
 Defines the Flask application, configures CORS, logging, and caching, and registers all HTTP routes
-and the SocketIO event handler. Before each request, the app runs two setup functions via
-`before_request`: `login_to_openshift()` authenticates against the OpenShift API if `OC_TOKEN` and
-`OC_SERVER` environment variables are set, and `create_gql_client()` initializes a GraphQL client
-for Bonfire's app-interface queries.
+and the SocketIO event handler. At startup, two initialization functions are called once:
+`login_to_openshift()` authenticates against the OpenShift API if `OC_TOKEN` and `OC_SERVER`
+environment variables are set, and `create_gql_client()` initializes a global GraphQL client for
+Bonfire's app-interface queries. These are invoked immediately at module load time (not as
+per-request hooks, despite the `before_request_funcs` assignment in the source).
 
 ### `firelink/apps.py` — App Catalog and Deployment
 
@@ -101,7 +116,8 @@ Three classes provide structured access to OpenShift/Kubernetes resources:
 - **`Node`** — Uses the Kubernetes Python client to list cluster nodes with capacity, allocatable
   resources, status, roles, and instance type metadata.
 - **`EphemeralResources`** — Queries the Kubernetes API for ephemeral namespaces (filtered by the
-  `ephemeral-` prefix, `operator-ns` label, and active phase) and namespace reservations (via the
+  `ephemeral-` prefix, `operator-ns` label, active phase, and excluding `ephemeral-base` and
+  `ephemeral-namespace-operator-system`) and namespace reservations (via the
   `cloud.redhat.com/v1alpha1` CRD).
 - **`Namespace`** — High-level namespace lifecycle operations (list, reserve, release, describe)
   that delegate to Bonfire library functions. The `list()` method cross-references namespaces with
@@ -118,10 +134,10 @@ query templates. Three metrics classes consume them:
 - **`PrometheusClusterMetrics`** — Cluster-wide CPU usage ratio, memory usage ratio, and per-node
   capacity/allocatable/usage breakdown. Usage is derived by subtracting allocatable from capacity.
 - **`PrometheusPodMetrics`** — Per-pod CPU and memory usage within a namespace, combining two
-  queries to produce a unified result. Memory values are converted from bytes to GB.
+  queries to produce a unified result. Memory values are converted from bytes to GiB.
 - **`PrometheusNamespaceMetrics`** — Per-namespace CPU and memory limits, requests, and usage.
   Supports batch queries across multiple namespaces using PromQL regex alternation. CPU values
-  handle millicore-to-core conversion; memory values are converted from bytes to MB.
+  handle millicore-to-core conversion; memory values are converted from bytes to MiB.
 
 All three metrics classes authenticate to Prometheus using the `OC_TOKEN` bearer token with TLS
 verification disabled.
@@ -139,8 +155,8 @@ verification disabled.
 
 The `AdaptorClassHelpers` class provides a `route_guard()` method called at the start of namespace
 and app operations. It checks whether the namespace reservation operator is present on the cluster
-and raises a Bonfire `FatalError` if not. This prevents operations from silently failing on clusters
-without the ephemeral namespace infrastructure.
+and calls `bonfire._error(bonfire.NO_RESERVATION_SYS)` if not. This prevents operations from
+silently failing on clusters without the ephemeral namespace infrastructure.
 
 ## API Endpoints
 
@@ -155,15 +171,17 @@ without the ephemeral namespace infrastructure.
 | GET | `/api/firelink/namespace/resource_metrics/<ns>` | `namespace_resource_metrics_single()` | CPU/memory metrics for a single namespace |
 | POST | `/api/firelink/namespace/top_pods` | `namespace_top_pods()` | Top pods by CPU/memory in a namespace |
 | GET | `/api/firelink/apps/list` | `apps_list()` | List deployable applications |
-| POST | `/api/firelink/get_template` | `get_template()` | Get processed deployment template for an app |
+| POST | `/api/firelink/get_template` | `get_template()` | Get processed deployment YAML template for an app |
 | GET | `/api/firelink/cluster/top_nodes` | `cluster_top_nodes()` | Per-node capacity and usage metrics |
 | GET | `/api/firelink/cluster/cpu_usage` | `cluster_cpu_usage()` | Cluster-wide CPU usage ratio |
 | GET | `/api/firelink/cluster/memory_usage` | `cluster_memory_usage()` | Cluster-wide memory usage ratio |
 
 ## WebSocket Protocol
 
-WebSocket communication uses socket.io at the path `/api/firelink/socket.io`. The backend listens
-for a single event:
+WebSocket communication uses Socket.IO at the path `/api/firelink/socket.io`. The frontend connects
+with long-polling transport only (`transports: ["polling"]`). In production, the proxy has a
+dedicated route for `/api/firelink/socket.io/*` that forwards WebSocket upgrade headers. The backend
+listens for a single event:
 
 - **`deploy-app`** — Receives a deployment options payload and initiates the deployment flow.
 
@@ -174,7 +192,8 @@ During deployment, the server emits three event types back to the client:
 - **`end-deploy-app`** — Deployment completion (`{message, completed, error}`)
 
 The SocketIO server is configured with a 600-second ping timeout to accommodate long-running
-deployments.
+deployments. The frontend applies its own 60-second inactivity timeout — if no
+`monitor-deploy-app` event arrives within 60 seconds, the client disconnects with an error.
 
 ## Environment Variables
 
@@ -234,9 +253,12 @@ Tekton pipelines in `.tekton/` automate the build on push to `master` and on pul
   because the server's workload is I/O-bound (Kubernetes API calls, Prometheus queries, WebSocket
   streaming) and gevent's cooperative scheduling handles concurrency within the single worker.
 - **No authentication layer.** The backend trusts the `requester` identity sent by the frontend in
-  request payloads. Authentication is handled upstream by the OAuth proxy in
-  [firelink-proxy][firelink-proxy]. This simplifies the backend but means it must always run behind
-  the proxy in production.
+  request payloads. The frontend derives `requester` from the `gap-auth` response header injected by
+  the OAuth proxy when fetching `/index.html`, splitting on `@` to extract the username (defaulting
+  to `"firelink-user"`). The `requester` field is included in `POST /namespace/reserve` and the
+  `deploy-app` WebSocket event, but not in `POST /namespace/release`. Authentication is handled
+  upstream by the OAuth proxy in [firelink-proxy][firelink-proxy]. This simplifies the backend but
+  means it must always run behind the proxy in production.
 - **Prometheus over Kubernetes metrics API.** Resource metrics (CPU, memory, pod usage) are queried
   from Prometheus rather than the Kubernetes Metrics API. This provides richer query capabilities
   (historical data, aggregation, per-namespace batch queries) but requires a Prometheus instance to
