@@ -1,5 +1,5 @@
-# UBI9 Python 3.11
-FROM registry.access.redhat.com/ubi9/python-311:9.7-1762229832
+# UBI9 Python 3.12
+FROM registry.access.redhat.com/ubi9/python-312:latest
 
 USER 0
 
@@ -26,8 +26,8 @@ WORKDIR $APP_SRC
 
 # Install deps with the correct interpreter
 COPY requirements.txt .
-RUN /usr/bin/python3.11 -m pip install -U pip setuptools wheel \
- && /usr/bin/python3.11 -m pip install --no-cache-dir -r requirements.txt
+RUN /usr/bin/python3.12 -m pip install -U pip setuptools wheel \
+ && /usr/bin/python3.12 -m pip install --no-cache-dir -r requirements.txt
 
 # Copy source
 COPY . .
